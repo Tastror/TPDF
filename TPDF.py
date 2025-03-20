@@ -4,11 +4,15 @@ import subprocess
 import threading
 import tkinter as tk
 from PIL import Image
+from pathlib import Path
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk, colorchooser
 
 # 设置放大比例
 scale_factor = 1.2
+# 设置接受的图片
+valid_suffix = [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"]
+
 
 size = f"{int(750 * scale_factor)}x{int(256 * scale_factor)}"
 
@@ -132,7 +136,7 @@ folder_label.pack(side=tk.LEFT)
 folder_spacer = tk.Label(folder_frame, text="", font=font_normal, width=small_label_spacer_width)
 folder_spacer.pack(side=tk.LEFT)
 
-folder_path = tk.StringVar(value=os.path.expanduser(get_desktop_path() + r"\TPDF输入图片"))
+folder_path = tk.StringVar(value=os.path.expanduser(str(Path(get_desktop_path()) / r"TPDF输入图片")))
 folder_entry = tk.Entry(folder_frame, textvariable=folder_path, width=large_entry_width, font=font_entry)
 folder_entry.pack(side=tk.LEFT)
 
@@ -219,7 +223,7 @@ def start_task():
     to_run = True
 
     dirname = folder_entry.get()
-    output = output_entry.get() + r"\TPDF-{}.pdf".format(datetime.now().strftime('%Y%m%d_%H%M%S'))
+    output = str(Path(output_entry.get()) / r"TPDF-{}.pdf".format(datetime.now().strftime('%Y%m%d_%H%M%S')))
     same_height_flag = bool(height_check_var.get())
     same_height = height_entry.get()
     same_width_flag = bool(width_check_var.get())
@@ -236,7 +240,8 @@ def start_task():
 
     filename_list = []
     for filename in os.listdir(dirname):
-        filename_list.append(filename)
+        if os.path.splitext(filename)[1].lower() in valid_suffix:
+            filename_list.append(filename)
     filename_list.sort()
 
     max_value = len(filename_list) + 10
