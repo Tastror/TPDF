@@ -31,18 +31,93 @@ except ImportError:
 
 
 # =============================================================================
+# DPI 感知（Windows HiDPI 支持）
+# =============================================================================
+# 默认 Python / Tkinter 应用是"DPI Unaware"的：在 150% 缩放屏上 Windows 会按
+# 100% 渲染再位图放大 → GUI 糊。下面在 `tk.Tk()` 之前声明 DPI 感知，告诉
+# Windows 直接让我们按物理像素绘制；然后把所有"像素"系数乘上 DPI_SCALE，
+# 保持字号与间距的比例。
+#
+# 字体用 UI_SCALE（仅应用设计放大率），因为 Tk 的 point→pixel 换算已按 DPI 生效；
+# 像素用 SCALE = UI_SCALE × DPI_SCALE。
+
+def _enable_dpi_awareness_and_get_scale() -> float:
+    """Windows：标记进程为 DPI-aware 并返回实际缩放倍数（1.0 / 1.25 / 1.5 …）。
+
+    必须在创建任何 `tk.Tk()` 之前调用。非 Windows 返回 1.0。
+    """
+    if sys.platform != "win32":
+        return 1.0
+    try:
+        import ctypes
+
+        def _ok(fn) -> bool:
+            """调用返回 BOOL / HRESULT 的 API；0 或 S_OK 视为成功。"""
+            try:
+                rv = fn()
+            except (AttributeError, OSError):
+                return False
+            return rv == 0 or rv is True or (isinstance(rv, int) and rv > 0)
+
+        # 三档依次尝试：Per-Monitor v2 (Win10 1703+) → Per-Monitor (Win 8.1+) → System
+        succeeded = False
+
+        # v2：SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2=-4)
+        # 需要把 -4 以 pointer-sized 整数传，否则在 64-bit 下会被截断为 0xFFFFFFFC。
+        try:
+            fn = ctypes.windll.user32.SetProcessDpiAwarenessContext
+            fn.argtypes = [ctypes.c_ssize_t]
+            fn.restype = ctypes.c_int
+            if fn(-4) != 0:  # BOOL 非零 = 成功
+                succeeded = True
+        except (AttributeError, OSError):
+            pass
+
+        # v1 Per-Monitor（Win 8.1+）：HRESULT；S_OK=0 表示成功
+        if not succeeded:
+            try:
+                fn = ctypes.windll.shcore.SetProcessDpiAwareness
+                fn.argtypes = [ctypes.c_int]
+                fn.restype = ctypes.c_long
+                hr = fn(2)  # PROCESS_PER_MONITOR_DPI_AWARE = 2
+                if hr == 0 or hr == -2147024891:  # S_OK 或 E_ACCESSDENIED（已设置过）
+                    succeeded = True
+            except (AttributeError, OSError):
+                pass
+
+        # 最原始的 System DPI Aware（Vista+）
+        if not succeeded:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except (AttributeError, OSError):
+                pass
+
+        # 读取主显示器 DPI
+        hdc = ctypes.windll.user32.GetDC(0)
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+        ctypes.windll.user32.ReleaseDC(0, hdc)
+        return max(1.0, dpi / 96.0)
+    except Exception:
+        return 1.0
+
+
+DPI_SCALE = _enable_dpi_awareness_and_get_scale()
+
+
+# =============================================================================
 # 常量
 # =============================================================================
 
-SCALE = 1.2
+UI_SCALE = 1.2                   # 应用设计放大率（字体用）
+SCALE = UI_SCALE * DPI_SCALE     # 像素放大率（PAD_*/窗口/缩略图用）
 
 WINDOW_SIZE = f"{int(780 * SCALE)}x{int(640 * SCALE)}"
 MIN_WINDOW_SIZE = (int(680 * SCALE), int(540 * SCALE))
 
-FONT_TITLE = ("微软雅黑", int(18 * SCALE), "bold")
-FONT_HEAD = ("微软雅黑", int(11 * SCALE), "bold")
-FONT_BODY = ("微软雅黑", int(10 * SCALE))
-FONT_SMALL = ("微软雅黑", int(9 * SCALE))
+FONT_TITLE = ("微软雅黑", int(18 * UI_SCALE), "bold")
+FONT_HEAD = ("微软雅黑", int(11 * UI_SCALE), "bold")
+FONT_BODY = ("微软雅黑", int(10 * UI_SCALE))
+FONT_SMALL = ("微软雅黑", int(9 * UI_SCALE))
 
 PAD_XS = int(3 * SCALE)
 PAD_S = int(6 * SCALE)
@@ -2018,6 +2093,13 @@ class TPDFApp:
         self._build_ui()
 
     def _setup_style(self) -> None:
+        # 强制 Tk 使用与系统 DPI 一致的 point→pixel 换算，避免旧版 Tk 未自动
+        # 感知 DPI 时字体显得偏小或偏大。96 DPI 对应 scaling = 1.333…
+        try:
+            self.root.tk.call("tk", "scaling", 96.0 / 72.0 * DPI_SCALE)
+        except tk.TclError:
+            pass
+
         style = ttk.Style()
         for theme in ("clam", "vista", "default"):
             if theme in style.theme_names():
