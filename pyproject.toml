@@ -1,0 +1,22 @@
+[project]
+name = "tpdf"
+version = "1.0.0"
+description = "TPDF — 图片 ↔ PDF 工具"
+readme = "readme.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "pillow>=10.0",
+    "pymupdf>=1.24",
+]
+
+# 打包时才需要的可选依赖：`uv sync --extra build`
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.0",
+]
+
+# 本仓库不是一个可安装的 Python 包（TPDF.py 是单文件脚本），
+# 告诉 uv 不要试图以 editable 方式安装自身。
+[tool.uv]
+package = false

@@ -1,4 +1,4 @@
-"""TPDF — 图片 ↔ PDF 工具。
+"""TPDF — PDF 工具。
 
 三个选项卡：
 - 图片 → PDF：把文件夹里的图片合成 PDF，可统一高 / 宽、按纸张比例（A4 / B5 / …）
@@ -2010,7 +2010,7 @@ class TPDFApp:
     def __init__(self) -> None:
         self.desktop = get_desktop_path()
         self.root = tk.Tk()
-        self.root.title("TPDF — 图片 ↔ PDF 工具")
+        self.root.title("TPDF — PDF 工具")
         self.root.geometry(WINDOW_SIZE)
         self.root.minsize(*MIN_WINDOW_SIZE)
         self.root.configure(bg=COLOR_BG)
@@ -2176,10 +2176,6 @@ class TPDFApp:
         header = ttk.Frame(self.root, padding=(PAD_L + PAD_S, PAD_M, PAD_L, 0))
         header.pack(fill="x")
         ttk.Label(header, text="TPDF", font=FONT_TITLE, foreground="#111827").pack(side="left")
-        ttk.Label(
-            header, text="   图片 ↔ PDF 工具",
-            font=FONT_BODY, foreground=COLOR_MUTED,
-        ).pack(side="left", pady=(PAD_S, 0))
 
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=PAD_L, pady=(PAD_S, PAD_S))

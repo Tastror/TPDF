@@ -1,4 +1,9 @@
 build/
 dist/
-*.spec
 .DS_Store
+.venv/
+__pycache__/
+
+# 仅忽略 PyInstaller 自动生成的 spec，保留我们自己写的 TPDF.spec
+*.spec
+!TPDF.spec
