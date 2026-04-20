@@ -1,6 +1,6 @@
 [project]
 name = "tpdf"
-version = "0.1.0"
+version = "0.1.1"
 description = "TPDF — 图片 ↔ PDF 工具"
 readme = "readme.md"
 requires-python = ">=3.10"
