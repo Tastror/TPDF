@@ -95,10 +95,18 @@ pyinstaller --noconfirm TPDF.spec
 ## 目录说明
 
 ```
-TPDF.py         # 主程序（单文件）
-TPDF.spec       # PyInstaller 打包脚本
-pyproject.toml  # uv / pip 依赖声明
-build.py        # 跨平台打包脚本
-readme.md       # 本文件
-legacy/         # 历史版本：旧的 CLI 脚本与上一版 GUI，保留以备参考
+TPDF.py              # 主程序（单文件）
+TPDF.spec            # PyInstaller 打包脚本（按平台分支）
+pyproject.toml       # uv / pip 依赖声明
+build.py             # 跨平台打包脚本
+readme.md            # 本文件
+icon/                # 应用图标
+├── generate_icon.py # 图标生成器（可重跑）
+├── TPDF.ico         # Windows 多尺寸图标（用于 exe 和窗口）
+├── TPDF.icns        # macOS 图标（用于 .app bundle）
+├── TPDF.png         # 256 px 通用 PNG
+└── TPDF_{16,32,48,64,128,256,512}.png   # 供 Tk iconphoto 使用的多尺寸 PNG
+legacy/              # 历史版本：旧的 CLI 脚本与上一版 GUI
 ```
+
+图标样式想改？直接编辑 `icon/generate_icon.py` 的 `draw_icon()`，再 `uv run python icon/generate_icon.py` 重跑即可覆盖所有尺寸。

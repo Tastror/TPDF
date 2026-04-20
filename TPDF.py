@@ -212,6 +212,39 @@ def run_in_background(target: Callable[[], None]) -> None:
     threading.Thread(target=target, daemon=True).start()
 
 
+def resource_path(relative: str) -> Path:
+    """返回资源文件的绝对路径，兼容 PyInstaller 打包后（sys._MEIPASS）与开发态。"""
+    base = getattr(sys, "_MEIPASS", None) or Path(__file__).resolve().parent
+    return Path(base) / relative
+
+
+def set_window_icon(root: tk.Tk) -> None:
+    """给 Tk 根窗口及其所有子 Toplevel 设置 icon/ 下的图标。
+
+    Windows 优先用 `.ico`（支持多尺寸、任务栏小图清晰）；其它平台用一组 PNG
+    走 `iconphoto`。读取失败时静默返回，不影响程序启动。
+    """
+    icon_dir = resource_path("icon")
+    try:
+        if sys.platform == "win32":
+            ico = icon_dir / "TPDF.ico"
+            if ico.exists():
+                root.iconbitmap(default=str(ico))
+                # 继续往下走，把 PNG 也交给 iconphoto，保证 Tk 内部的
+                # 任务栏图标在某些情况（如多 Toplevel）也能正常显示
+        photos: list[ImageTk.PhotoImage] = []
+        for size in (256, 128, 64, 48, 32, 16):
+            p = icon_dir / f"TPDF_{size}.png"
+            if p.exists():
+                photos.append(ImageTk.PhotoImage(Image.open(p)))
+        if photos:
+            root.iconphoto(True, *photos)
+            # 防止 PhotoImage 被 Python GC：挂到 root 上保留强引用
+            root._tpdf_icon_photos = photos  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def parse_page_ranges(expr: str, total: int) -> Optional[set[int]]:
     """把 `1-5, 7, 10-12` 样式的表达式解析为 **0-based** 页面索引集合。
 
@@ -2089,6 +2122,7 @@ class TPDFApp:
         self.root.geometry(WINDOW_SIZE)
         self.root.minsize(*MIN_WINDOW_SIZE)
         self.root.configure(bg=COLOR_BG)
+        set_window_icon(self.root)
         self._setup_style()
         self._build_ui()
 

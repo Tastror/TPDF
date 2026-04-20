@@ -11,11 +11,16 @@ import sys
 IS_MAC = sys.platform == "darwin"
 
 
+ICON_ICO = 'icon/TPDF.ico'
+ICON_ICNS = 'icon/TPDF.icns'
+
+
 a = Analysis(
     ['TPDF.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    # 把 icon/ 目录整体打包进产物，让打包后的应用也能读到运行时窗口图标
+    datas=[('icon', 'icon')],
     hiddenimports=['fitz'],
     hookspath=[],
     hooksconfig={},
@@ -58,7 +63,7 @@ if IS_MAC:
     app = BUNDLE(
         coll,
         name='TPDF.app',
-        icon=None,
+        icon=ICON_ICNS,
         bundle_identifier='com.tpdf.app',
         info_plist={
             'CFBundleName': 'TPDF',
@@ -77,6 +82,7 @@ else:
         a.datas,
         [],
         name='TPDF',
+        icon=ICON_ICO,
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
