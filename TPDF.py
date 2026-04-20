@@ -171,16 +171,49 @@ def normalize_path(p: str) -> str:
     return p.replace("/", "\\") if sys.platform == "win32" else p
 
 
+def resolve_initial_dir(current: str, fallback: str) -> str:
+    """为文件/文件夹对话框推算一个合适的 `initialdir`。
+
+    优先级：
+    - `current` 是已存在的文件夹 → 直接用它
+    - `current` 是已存在的文件   → 用它的父文件夹
+    - `current` 非空但不存在     → 向上回溯到最近的已存在祖先目录
+    - 都不满足                   → `fallback`
+    """
+    current = (current or "").strip().strip('"')
+    if current:
+        try:
+            p = Path(current).expanduser()
+        except (OSError, ValueError):
+            p = None
+        if p is not None:
+            try:
+                if p.is_dir():
+                    return str(p)
+                if p.is_file():
+                    return str(p.parent)
+                for parent in p.parents:
+                    if parent.is_dir():
+                        return str(parent)
+            except OSError:
+                pass
+    return fallback
+
+
 def pick_folder_into(entry: ttk.Entry, initial: Optional[str] = None) -> None:
-    folder = filedialog.askdirectory(initialdir=initial or os.path.expanduser(get_desktop_path()))
+    fallback = initial or get_desktop_path()
+    start = resolve_initial_dir(entry.get(), fallback)
+    folder = filedialog.askdirectory(initialdir=start)
     if folder:
         entry.delete(0, tk.END)
         entry.insert(0, normalize_path(folder))
 
 
 def pick_pdf_into(entry: ttk.Entry, initial: Optional[str] = None) -> None:
+    fallback = initial or get_desktop_path()
+    start = resolve_initial_dir(entry.get(), fallback)
     f = filedialog.askopenfilename(
-        initialdir=initial or os.path.expanduser(get_desktop_path()),
+        initialdir=start,
         filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
     )
     if f:
@@ -210,6 +243,48 @@ def is_digit_or_empty(s: str) -> bool:
 
 def run_in_background(target: Callable[[], None]) -> None:
     threading.Thread(target=target, daemon=True).start()
+
+
+# -----------------------------------------------------------------------------
+# 自然排序（与 Windows 资源管理器一致）
+# -----------------------------------------------------------------------------
+
+def _build_natural_sort_key():
+    """返回一个可用作 `sorted(..., key=...)` 的键函数。
+
+    Windows 优先直接调 `shlwapi.StrCmpLogicalW`——这正是文件资源管理器对
+    "图片1 / 图片2 / 图片10" 的排序实现，处理：
+    - 文本段：大小写不敏感 + 按语言环境比较
+    - 数字段：当作整数比较（所以 `图片2` 排在 `图片10` 前）
+
+    其它平台退化为一个 Python 纯实现：按正则拆成 (文本, 数字, 文本, …)
+    的 token 列表，文本用大小写折叠比较，数字段当整数比较。
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            import functools
+            fn = ctypes.windll.shlwapi.StrCmpLogicalW
+            fn.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+            fn.restype = ctypes.c_int
+            return functools.cmp_to_key(lambda a, b: fn(a, b))
+        except Exception:
+            pass
+
+    _DIGITS = re.compile(r"(\d+)")
+
+    def _key(name: str):
+        parts = _DIGITS.split(name)
+        return tuple(
+            (1, int(p)) if p.isdigit() else (0, p.casefold())
+            for p in parts
+        )
+
+    return _key
+
+
+# 在模块加载时只构造一次
+NATURAL_SORT_KEY = _build_natural_sort_key()
 
 
 def resource_path(relative: str) -> Path:
@@ -498,6 +573,9 @@ class ProgressDialog:
         self._bar.configure(value=self._bar["maximum"])
         self._label.configure(text=text)
         self._btn.configure(text="完成", state="normal", command=self.close)
+        # 任务已完成，窗口的关闭 (X) 按钮改为直接关闭；否则会继续走
+        # request_cancel，把唯一的"完成"按钮禁用掉导致无法关窗。
+        self.top.protocol("WM_DELETE_WINDOW", self.close)
 
     def close(self) -> None:
         try:
@@ -610,7 +688,7 @@ class Img2PdfTab(TabBase):
             group, text="选择", command=lambda: pick_folder_into(in_entry, self.desktop),
         ).grid(row=0, column=2, padx=(PAD_S, PAD_XS))
         ttk.Button(
-            group, text="新建", command=lambda: ensure_folder(self.folder_var.get()),
+            group, text="新建该文件夹", command=lambda: ensure_folder(self.folder_var.get()),
         ).grid(row=0, column=3, padx=PAD_XS)
 
         ttk.Label(group, text="输出 PDF 到").grid(
@@ -1028,9 +1106,14 @@ class Img2PdfTab(TabBase):
                 messagebox.showerror("错误", "统一宽度需为正整数")
                 return None
 
+        # 使用 Windows 资源管理器风格的自然排序：
+        #   图片1.jpg, 图片2.jpg, 图片10.jpg, 图片11.jpg
+        # 而不是 ASCII 字典序的：
+        #   图片1.jpg, 图片10.jpg, 图片11.jpg, 图片2.jpg
         filenames = sorted(
-            f for f in os.listdir(dirname)
-            if os.path.splitext(f)[1].lower() in VALID_IMG_SUFFIX
+            (f for f in os.listdir(dirname)
+             if os.path.splitext(f)[1].lower() in VALID_IMG_SUFFIX),
+            key=NATURAL_SORT_KEY,
         )
         if not filenames:
             messagebox.showerror("错误", "文件夹内没有支持的图片")
@@ -1146,7 +1229,7 @@ class Pdf2ImgTab(TabBase):
             paths, text="选择", command=lambda: pick_folder_into(out_entry, self.desktop)
         ).grid(row=1, column=2, padx=(PAD_S, PAD_XS), pady=(PAD_S, 0))
         ttk.Button(
-            paths, text="新建", command=lambda: ensure_folder(self.out_var.get())
+            paths, text="新建该文件夹", command=lambda: ensure_folder(self.out_var.get())
         ).grid(row=1, column=3, padx=PAD_XS, pady=(PAD_S, 0))
 
         # 模式
@@ -1218,6 +1301,7 @@ class Pdf2ImgTab(TabBase):
     ) -> None:
         pdf_document = None
         try:
+            dlg.set_progress(0, "正在打开 PDF…")
             pdf_document = fitz.open(pdf_path)
             total = len(pdf_document)
             dlg.set_maximum(max(total, 1))
@@ -1339,6 +1423,10 @@ class PdfEditTab(TabBase):
         self.mode_var = tk.StringVar(value="merge")
         self.chunk_size_var = tk.StringVar(value="10")
         self.status_var = tk.StringVar(value="尚未加载 PDF")
+        self.out_var = tk.StringVar(value=normalize_path(desktop))
+
+        # ── 记住上次用过的路径（"添加 PDF" 无 Entry 可读时用）──
+        self._last_input_dir: Optional[str] = None
 
         self._build()
 
@@ -1368,7 +1456,10 @@ class PdfEditTab(TabBase):
         bar = ttk.Frame(self)
         bar.pack(fill="x")
         ttk.Button(bar, text="＋ 添加 PDF", command=self._on_add_pdf).pack(side="left")
-        ttk.Button(bar, text="清空", command=self._on_clear_all).pack(side="left", padx=(PAD_S, 0))
+        ttk.Button(bar, text="管理…", command=self._on_manage_pdfs).pack(
+            side="left", padx=(PAD_S, 0)
+        )
+        ttk.Button(bar, text="清空 PDF", command=self._on_clear_all).pack(side="left", padx=(PAD_S, 0))
         ttk.Label(
             bar, textvariable=self.status_var,
             font=FONT_SMALL, foreground=COLOR_MUTED,
@@ -1404,8 +1495,40 @@ class PdfEditTab(TabBase):
         self.canvas.bind("<Button-1>", self._on_canvas_click)
 
     def _build_side(self, parent: ttk.Frame) -> None:
-        side = ttk.Frame(parent)
-        side.grid(row=0, column=1, sticky="ns")
+        # 侧边栏整体塞进一个 Canvas 里，窗口太矮时可以纵向滚动，
+        # 保证"导出 PDF"等底部按钮永远可达。
+        outer = ttk.Frame(parent)
+        outer.grid(row=0, column=1, sticky="ns")
+        outer.rowconfigure(0, weight=1)
+
+        self._side_canvas = tk.Canvas(
+            outer, background=COLOR_BG, highlightthickness=0, borderwidth=0,
+            width=int(260 * SCALE),
+        )
+        self._side_canvas.grid(row=0, column=0, sticky="ns")
+        side_vbar = ttk.Scrollbar(outer, orient="vertical", command=self._side_canvas.yview)
+        side_vbar.grid(row=0, column=1, sticky="ns")
+        self._side_canvas.configure(yscrollcommand=side_vbar.set)
+
+        side = ttk.Frame(self._side_canvas, style="TFrame")
+        self._side_window = self._side_canvas.create_window((0, 0), window=side, anchor="nw")
+
+        def _on_side_canvas_configure(event) -> None:
+            # 让内部 frame 宽度始终 = canvas 宽度，这样里面 pack(fill="x") 的控件稳定对齐，
+            # 也不会出现水平滚动
+            self._side_canvas.itemconfig(self._side_window, width=event.width)
+
+        def _on_side_inner_configure(_event) -> None:
+            bbox = self._side_canvas.bbox("all")
+            if bbox is not None:
+                self._side_canvas.configure(scrollregion=bbox)
+
+        self._side_canvas.bind("<Configure>", _on_side_canvas_configure)
+        side.bind("<Configure>", _on_side_inner_configure)
+
+        # 鼠标进入侧栏时接管滚轮（主网格也有同样模式，两者靠 Enter/Leave 切换，不冲突）
+        self._side_canvas.bind("<Enter>", self._on_side_enter)
+        self._side_canvas.bind("<Leave>", self._on_side_leave)
 
         # — 选择 —
         sel = ttk.LabelFrame(side, text="选择", padding=PAD_S)
@@ -1425,19 +1548,22 @@ class PdfEditTab(TabBase):
         ttk.Button(row2, text="反选", command=self._on_invert, width=6).pack(side="left", padx=PAD_XS)
         ttk.Button(row2, text="清除", command=self._on_clear_selection, width=6).pack(side="left")
 
-        # — 移动 —
+        # — 移动 —（四个按钮等宽同行；侧栏窄，用紧凑样式 + grid uniform 保证严格等宽）
         mv = ttk.LabelFrame(side, text="移动所选", padding=PAD_S)
         mv.pack(fill="x", pady=(PAD_S, 0))
         row = ttk.Frame(mv); row.pack(fill="x")
-        ttk.Button(row, text="← 前移", command=lambda: self._on_move(-1), width=8).pack(side="left")
-        ttk.Button(row, text="后移 →", command=lambda: self._on_move(+1), width=8).pack(
-            side="left", padx=(PAD_XS, 0)
-        )
-        row2 = ttk.Frame(mv); row2.pack(fill="x", pady=(PAD_XS, 0))
-        ttk.Button(row2, text="置顶", command=lambda: self._on_move_edge(True), width=8).pack(side="left")
-        ttk.Button(row2, text="置底", command=lambda: self._on_move_edge(False), width=8).pack(
-            side="left", padx=(PAD_XS, 0)
-        )
+        move_buttons = [
+            ("置顶", lambda: self._on_move_edge(True)),
+            ("←",   lambda: self._on_move(-1)),
+            ("→",   lambda: self._on_move(+1)),
+            ("置底", lambda: self._on_move_edge(False)),
+        ]
+        for i, (txt, cmd) in enumerate(move_buttons):
+            row.columnconfigure(i, weight=1, uniform="mv")
+            ttk.Button(row, text=txt, command=cmd, style="Compact.TButton").grid(
+                row=0, column=i, sticky="ew",
+                padx=(0 if i == 0 else PAD_XS, 0),
+            )
 
         # — 操作 —
         op = ttk.LabelFrame(side, text="操作", padding=PAD_S)
@@ -1454,6 +1580,24 @@ class PdfEditTab(TabBase):
         # — 输出 —
         out = ttk.LabelFrame(side, text="导出", padding=PAD_S)
         out.pack(fill="x", pady=(PAD_S, 0))
+
+        # 输出路径
+        path_row = ttk.Frame(out); path_row.pack(fill="x")
+        ttk.Label(path_row, text="输出到", font=FONT_SMALL).pack(
+            side="left", padx=(0, PAD_XS)
+        )
+        # 先把"选择"按钮 pack 到右边拿满自身宽度，再让 Entry 填中间，
+        # 避免 Entry fill=expand 时把按钮文字挤没
+        out_entry = ttk.Entry(path_row, textvariable=self.out_var)
+        pick_btn = ttk.Button(
+            path_row, text="选择", style="Compact.TButton",
+            command=lambda: pick_folder_into(out_entry, self.desktop),
+        )
+        pick_btn.pack(side="right", padx=(PAD_XS, 0))
+        out_entry.pack(side="left", fill="x", expand=True)
+
+        ttk.Separator(out).pack(fill="x", pady=(PAD_S, PAD_XS))
+
         ttk.Radiobutton(out, text="合并为一个 PDF",
                         variable=self.mode_var, value="merge").pack(anchor="w")
         ttk.Radiobutton(out, text="按切分点拆分",
@@ -1466,9 +1610,6 @@ class PdfEditTab(TabBase):
             validate="key",
             validatecommand=(self.register(is_digit_or_empty), "%P"),
         ).pack(side="left", padx=PAD_XS)
-        ttk.Radiobutton(out, text="按来源文件拆分",
-                        variable=self.mode_var, value="source").pack(anchor="w")
-
         ttk.Button(
             side, text="  导出 PDF  ", style="Accent.TButton", command=self._on_export,
         ).pack(fill="x", pady=(PAD_M, 0), ipady=PAD_XS)
@@ -1501,27 +1642,65 @@ class PdfEditTab(TabBase):
             return
         paths = filedialog.askopenfilenames(
             title="选择 PDF（可多选）",
-            initialdir=self.desktop,
+            initialdir=resolve_initial_dir(self._last_input_dir or "", self.desktop),
             filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
         )
         if not paths:
             return
-        for p in paths:
-            self._add_pdf(p)
-        self._update_status()
-        self._relayout()
-        self._schedule_render_missing()
+        self._last_input_dir = os.path.dirname(paths[0])
 
-    def _add_pdf(self, path: str) -> None:
+        # 大 PDF 的 fitz.open 可能要几秒；用进度对话框放后台线程加载
+        dlg = ProgressDialog(
+            self.winfo_toplevel(), "加载 PDF", maximum=len(paths),
+        )
+        run_in_background(lambda: self._load_pdfs_worker(list(paths), dlg))
+
+    def _load_pdfs_worker(self, paths: list[str], dlg: ProgressDialog) -> None:
+        """后台把 `paths` 逐个 `fitz.open` 并 register 到主线程。"""
+        loaded = 0
+        errors: list[tuple[str, str]] = []
         try:
-            doc = fitz.open(path)
+            for i, p in enumerate(paths):
+                if dlg.cancelled:
+                    break
+                name = os.path.basename(p)
+                dlg.set_progress(i, f"加载：{name}  （{i + 1}/{len(paths)}）")
+                try:
+                    doc = fitz.open(p)
+                    n = len(doc)  # 触发页树解析，让后续访问变快
+                except Exception as e:
+                    errors.append((p, str(e)))
+                    continue
+                self.after(0, self._register_loaded_doc, doc, p, n)
+                loaded += 1
+            dlg.set_progress(len(paths), "正在刷新界面…")
+
+            def _finish() -> None:
+                self._update_status()
+                self._relayout()
+                self._schedule_render_missing()
+            self.after(0, _finish)
+
+            if errors:
+                def _show_errors(errs=errors) -> None:
+                    msg = "\n".join(f"• {os.path.basename(p)}：{e}" for p, e in errs)
+                    messagebox.showerror("错误", f"以下 PDF 无法打开：\n{msg}")
+                self.after(0, _show_errors)
+
+            if dlg.cancelled:
+                self.after(0, dlg.close)
+            else:
+                self.after(0, lambda: dlg.finish(f"已加载 {loaded} 个 PDF"))
         except Exception as e:
-            messagebox.showerror("错误", f"无法打开：{path}\n({e})")
-            return
+            self.after(0, dlg.close)
+            self.after(0, lambda err=e: messagebox.showerror("错误", f"加载失败\n({err})"))
+
+    def _register_loaded_doc(self, doc, path: str, n_pages: int) -> None:
+        """主线程：把后台打开好的 fitz.Document 注册进数据模型。"""
         doc_id = len(self.loaded_docs)
         label = os.path.basename(path)
         self.loaded_docs.append({"path": path, "doc": doc, "label": label})
-        for i in range(len(doc)):
+        for i in range(n_pages):
             self.pages.append(PageRef(doc_id, i, label))
 
     def _on_clear_all(self) -> None:
@@ -1544,6 +1723,217 @@ class PdfEditTab(TabBase):
         self.anchor_idx = None
         self._update_status()
         self._relayout()
+
+    # ------------------------------------------------------------------
+    # 管理已加载的 PDF（重排 / 移除整个文件）
+    # ------------------------------------------------------------------
+
+    def _on_manage_pdfs(self) -> None:
+        """打开对话框：可以重排或移除某个已加载 PDF，确认后一次性应用。"""
+        if not self.loaded_docs:
+            messagebox.showinfo("提示", "尚未加载 PDF")
+            return
+
+        top = self.winfo_toplevel()
+        dlg = tk.Toplevel(top)
+        dlg.title("管理已加载的 PDF")
+        dlg.transient(top)
+        dlg.geometry(f"{int(560 * SCALE)}x{int(380 * SCALE)}")
+        dlg.minsize(int(420 * SCALE), int(280 * SCALE))
+        dlg.grab_set()
+        set_window_icon(dlg)
+
+        # 本地工作副本：order 为 doc_id 的显示顺序；removed 记录被移除的 doc_id。
+        # 用户点"应用"之前不影响主界面。
+        order: list[int] = list(range(len(self.loaded_docs)))
+        removed: set[int] = set()
+
+        body = ttk.Frame(dlg, padding=PAD_M)
+        body.pack(fill="both", expand=True)
+        body.rowconfigure(1, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            body,
+            text="拖动不便时可用 ↑ / ↓ 按钮调整顺序；✕ 可移除单个 PDF。",
+            font=FONT_SMALL, foreground=COLOR_MUTED,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, PAD_XS))
+
+        lb = tk.Listbox(
+            body, activestyle="none", selectmode="browse", font=FONT_BODY,
+            highlightthickness=1, highlightbackground=COLOR_BORDER,
+            background="white",
+        )
+        lb.grid(row=1, column=0, sticky="nsew")
+        vb = ttk.Scrollbar(body, orient="vertical", command=lb.yview)
+        vb.grid(row=1, column=1, sticky="ns")
+        lb.configure(yscrollcommand=vb.set)
+
+        btns = ttk.Frame(body)
+        btns.grid(row=1, column=2, sticky="ns", padx=(PAD_S, 0))
+
+        def visible_positions() -> list[int]:
+            """返回当前可见条目在 `order` 里的下标列表（按显示顺序）。"""
+            return [i for i in range(len(order)) if order[i] not in removed]
+
+        def render(select_doc: Optional[int] = None) -> None:
+            lb.delete(0, "end")
+            vis = visible_positions()
+            for pos in vis:
+                doc_id = order[pos]
+                d = self.loaded_docs[doc_id]
+                try:
+                    n = len(d["doc"])
+                except Exception:
+                    n = 0
+                lb.insert("end", f"  {d['label']}    ·    {n} 页")
+            if not vis:
+                return
+            lb.selection_clear(0, "end")
+            if select_doc is not None and select_doc in [order[p] for p in vis]:
+                idx = [order[p] for p in vis].index(select_doc)
+            else:
+                idx = 0
+            lb.selection_set(idx)
+            lb.activate(idx)
+            lb.see(idx)
+
+        def current_pos() -> Optional[int]:
+            sel = lb.curselection()
+            if not sel:
+                return None
+            vis = visible_positions()
+            if sel[0] >= len(vis):
+                return None
+            return vis[sel[0]]
+
+        def move(delta: int) -> None:
+            pos = current_pos()
+            if pos is None:
+                return
+            vis = visible_positions()
+            vi = vis.index(pos)
+            ni = vi + delta
+            if not (0 <= ni < len(vis)):
+                return
+            a, b = pos, vis[ni]
+            order[a], order[b] = order[b], order[a]
+            render(select_doc=order[b])
+
+        def remove_sel() -> None:
+            pos = current_pos()
+            if pos is None:
+                return
+            doc_id = order[pos]
+            removed.add(doc_id)
+            # 选择跳到相邻项
+            vis = visible_positions()
+            if vis:
+                next_pos = vis[min(
+                    len(vis) - 1,
+                    sum(1 for p in range(pos) if order[p] not in removed),
+                )]
+                render(select_doc=order[next_pos])
+            else:
+                render()
+
+        def restore_all() -> None:
+            removed.clear()
+            render()
+
+        ttk.Button(btns, text="↑ 上移", command=lambda: move(-1), width=7).pack(fill="x")
+        ttk.Button(
+            btns, text="↓ 下移", command=lambda: move(+1), width=7,
+        ).pack(fill="x", pady=(PAD_XS, 0))
+        ttk.Button(
+            btns, text="✕ 移除", command=remove_sel, width=7,
+        ).pack(fill="x", pady=(PAD_M, 0))
+        ttk.Button(
+            btns, text="撤销移除", command=restore_all, width=7,
+        ).pack(fill="x", pady=(PAD_XS, 0))
+
+        # 底部提示 + 应用/取消
+        bottom = ttk.Frame(dlg, padding=(PAD_M, 0, PAD_M, PAD_M))
+        bottom.pack(fill="x")
+        ttk.Label(
+            bottom,
+            text="应用后会按 PDF 顺序重排所有页面，切分点与选择将被清除",
+            font=FONT_SMALL, foreground=COLOR_MUTED,
+        ).pack(side="left")
+
+        def on_apply() -> None:
+            self._apply_manage(
+                kept_order=[d for d in order if d not in removed],
+                removed=removed,
+            )
+            dlg.destroy()
+
+        ttk.Button(bottom, text="取消", command=dlg.destroy).pack(side="right")
+        ttk.Button(
+            bottom, text="应用", style="Accent.TButton", command=on_apply,
+        ).pack(side="right", padx=(0, PAD_S))
+
+        # 快捷键
+        lb.bind("<Double-Button-1>", lambda e: None)  # 屏蔽默认行为
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+        render()
+        lb.focus_set()
+
+    def _apply_manage(self, kept_order: list[int], removed: set[int]) -> None:
+        """把"管理 PDF"对话框的结果应用到主界面。
+
+        - `kept_order`：按新显示顺序排列的、保留下来的旧 doc_id 列表
+        - `removed`   ：被移除的 doc_id 集合
+        """
+        # 如果实际没有变化，直接返回
+        no_reorder = kept_order == [d for d in range(len(self.loaded_docs)) if d not in removed]
+        if not removed and no_reorder:
+            return
+
+        # 先按旧 doc_id 把当前页面分组，保留组内相对顺序（尊重用户已做过的页级排序）
+        grouped: dict[int, list[PageRef]] = {}
+        for p in self.pages:
+            grouped.setdefault(p.doc_id, []).append(p)
+
+        # 停掉正在进行的缩略图渲染，避免它给已移除的文档继续写缓存
+        self._render_stop.set()
+        self._render_stop = threading.Event()
+
+        # 关掉被移除的 PDF
+        for doc_id in removed:
+            try:
+                self.loaded_docs[doc_id]["doc"].close()
+            except Exception:
+                pass
+
+        # 重建 loaded_docs，并建立 "旧 doc_id → 新 doc_id" 的映射
+        old_to_new = {old: new for new, old in enumerate(kept_order)}
+        self.loaded_docs = [self.loaded_docs[d] for d in kept_order]
+
+        # 重建 pages：按新顺序串接各 doc 的当前页面，并更新 doc_id
+        new_pages: list[PageRef] = []
+        for old_doc_id in kept_order:
+            for p in grouped.get(old_doc_id, []):
+                p.doc_id = old_to_new[old_doc_id]
+                new_pages.append(p)
+        self.pages = new_pages
+
+        # 缩略图缓存也要跟着重新索引，避免白白重渲染
+        self.thumb_cache = {
+            (old_to_new[old_doc_id], page_index): photo
+            for (old_doc_id, page_index), photo in self.thumb_cache.items()
+            if old_doc_id in old_to_new
+        }
+
+        # 重排过后选择 / 切分点的语义容易对不上，一律清除
+        self.selected.clear()
+        self.split_markers.clear()
+        self.anchor_idx = None
+
+        self._update_status()
+        self._relayout()
+        self._schedule_render_missing()
 
     # ------------------------------------------------------------------
     # 选择
@@ -1690,6 +2080,16 @@ class PdfEditTab(TabBase):
 
     def _on_mousewheel(self, event) -> None:
         self.canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    # 侧边栏滚轮：鼠标进入时接管，离开时解绑
+    def _on_side_enter(self, _event) -> None:
+        self._side_canvas.bind_all("<MouseWheel>", self._on_side_mousewheel)
+
+    def _on_side_leave(self, _event) -> None:
+        self._side_canvas.unbind_all("<MouseWheel>")
+
+    def _on_side_mousewheel(self, event) -> None:
+        self._side_canvas.yview_scroll(int(-event.delta / 120), "units")
 
     def _get_placeholder(self) -> ImageTk.PhotoImage:
         if self._placeholder is None:
@@ -2006,11 +2406,12 @@ class PdfEditTab(TabBase):
             messagebox.showerror("错误", "队列为空")
             return
 
-        out_dir = filedialog.askdirectory(
-            title="选择输出文件夹",
-            initialdir=self.desktop,
-        )
+        out_dir = self.out_var.get().strip()
         if not out_dir:
+            messagebox.showerror("错误", "请先设置输出文件夹")
+            return
+        if not os.path.isdir(out_dir):
+            messagebox.showerror("错误", "输出文件夹不存在")
             return
 
         mode = self.mode_var.get()
@@ -2027,8 +2428,6 @@ class PdfEditTab(TabBase):
                 messagebox.showerror("错误", "请输入正整数 N")
                 return
             segments = [self.pages[i:i + n] for i in range(0, len(self.pages), n)]
-        elif mode == "source":
-            segments = self._segments_by_source()
         else:
             return
 
@@ -2054,20 +2453,6 @@ class PdfEditTab(TabBase):
             if i in self.split_markers:
                 segs.append(cur)
                 cur = []
-        if cur:
-            segs.append(cur)
-        return segs
-
-    def _segments_by_source(self) -> list[list[PageRef]]:
-        segs: list[list[PageRef]] = []
-        cur: list[PageRef] = []
-        last_doc = -1
-        for p in self.pages:
-            if p.doc_id != last_doc and cur:
-                segs.append(cur)
-                cur = []
-            cur.append(p)
-            last_doc = p.doc_id
         if cur:
             segs.append(cur)
         return segs
@@ -2238,6 +2623,12 @@ class TPDFApp:
 
         # 普通按钮
         style.configure("TButton", padding=(PAD_M, PAD_XS + 2), font=FONT_BODY)
+
+        # 紧凑按钮：字号小一号、内边距减半，用于狭窄区域（例如侧栏中同行并排 3~4 个按钮）
+        style.configure(
+            "Compact.TButton",
+            padding=(PAD_XS, PAD_XS), font=FONT_SMALL,
+        )
 
         # 主按钮（蓝底白字）
         style.configure(
