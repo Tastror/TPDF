@@ -1,6 +1,8 @@
-# TPDF
+# <img src="icon/TPDF.png" width="24" height="24" alt="TPDF"> TPDF
 
 一个图形界面的 PDF 工具
+
+![demo](img/demo.png)
 
 - **图片 → PDF**：把文件夹里的图片合成 PDF
   - 可单向或双向统一高度 / 宽度
