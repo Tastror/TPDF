@@ -6,13 +6,28 @@
 - macOS：onedir 模式，产物 `dist/TPDF.app` 标准 .app 包。
   （macOS 的 .app 本质是目录，无法与 onefile 共存。）
 """
+import re
 import sys
+from pathlib import Path
 
 IS_MAC = sys.platform == "darwin"
 
 
 ICON_ICO = 'icon/TPDF.ico'
 ICON_ICNS = 'icon/TPDF.icns'
+
+
+# 从 pyproject.toml 读取版本，保持唯一来源
+def _read_version() -> str:
+    try:
+        text = (Path(SPECPATH) / "pyproject.toml").read_text(encoding="utf-8")
+        m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+        return m.group(1) if m else "0.0.0"
+    except Exception:
+        return "0.0.0"
+
+
+VERSION = _read_version()
 
 
 a = Analysis(
@@ -68,8 +83,8 @@ if IS_MAC:
         info_plist={
             'CFBundleName': 'TPDF',
             'CFBundleDisplayName': 'TPDF',
-            'CFBundleShortVersionString': '1.0.0',
-            'CFBundleVersion': '1.0.0',
+            'CFBundleShortVersionString': VERSION,
+            'CFBundleVersion': VERSION,
             'NSHighResolutionCapable': 'True',
         },
     )

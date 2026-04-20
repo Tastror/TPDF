@@ -82,6 +82,82 @@ codesign --force --deep --sign - dist/TPDF.app
 
 后续如果需要公证（notarize）发布到非开发模式的 Mac，请配合 Apple Developer 证书。
 
+## 发布到 GitHub Release
+
+仓库自带两个脚本，配合 [GitHub CLI](https://cli.github.com/) 一键完成发布：
+
+- `release_build.py`：自动识别当前 OS + 架构，构建并把产物规范命名为 `TPDF-v{version}-{os}-{arch}.{ext}`，同时生成 `.sha256`。
+- `release_publish.py`：自动打 tag、推送、`gh release create`（或已存在时 `gh release upload --clobber`）。
+
+> ⚠️ PyInstaller **不支持真正的跨平台编译**。`release_build.py` 需要在**每个目标 OS 上各跑一次**，产物都会落到 `dist/release/` 下；收齐后再跑一次 `release_publish.py` 一次性全部上传。
+
+### 1. 更新版本号
+
+版本号由 `pyproject.toml` 的 `version` 字段单一来源，`TPDF.spec`（macOS bundle 版本）和两个脚本都会读它：
+
+```toml
+# pyproject.toml
+version = "0.1.0"
+```
+
+### 2. 在每个平台构建
+
+在 Windows / macOS / Linux 各自执行：
+
+```shell
+uv run --extra build python release_build.py --clean
+```
+
+产物（以 v0.1.0 为例）：
+
+| 平台 | 产物 |
+| --- | --- |
+| Windows x64 | `dist/release/TPDF-v0.1.0-windows-x64.exe` |
+| Linux x64 | `dist/release/TPDF-v0.1.0-linux-x64` |
+| macOS arm64 | `dist/release/TPDF-v0.1.0-macos-arm64.zip` |
+| macOS x64 | `dist/release/TPDF-v0.1.0-macos-x64.zip` |
+
+每个产物旁都会有一份 `*.sha256` 校验文件。
+
+把不同平台的产物统一汇到同一台机器上的 `dist/release/` 目录（直接拷贝过去即可，脚本只看文件名）。
+
+### 3. 一键发布
+
+先装好 `gh` 并登录：
+
+```shell
+# Windows
+winget install --id GitHub.cli
+# macOS
+brew install gh
+# 之后
+gh auth login
+```
+
+然后：
+
+```shell
+python release_publish.py
+```
+
+脚本会：
+
+1. 从 `pyproject.toml` 读版本 → 派生 tag `v0.1.0`
+2. 校验工作区干净（可加 `--allow-dirty` 跳过）
+3. 本地没 tag 就创建 + 推送到 origin
+4. 没有 release 就 `gh release create --generate-notes` + 上传所有产物
+5. 已有 release（比如先发了 Windows，后补 macOS）就 `gh release upload --clobber`
+
+常用参数：
+
+```shell
+python release_publish.py --draft            # 发布为草稿
+python release_publish.py --prerelease       # 标记预发布
+python release_publish.py --notes-file NOTES.md
+python release_publish.py --no-sha256        # 不上传校验文件
+python release_publish.py -y                 # 跳过交互确认
+```
+
 ## 不用 uv，也行
 
 `TPDF.py` 本身仅依赖 `pillow` 和 `pymupdf`，任何 Python ≥ 3.10 的环境都能跑：
@@ -96,9 +172,11 @@ pyinstaller --noconfirm TPDF.spec
 
 ```
 TPDF.py              # 主程序（单文件）
-TPDF.spec            # PyInstaller 打包脚本（按平台分支）
-pyproject.toml       # uv / pip 依赖声明
-build.py             # 跨平台打包脚本
+TPDF.spec            # PyInstaller 打包脚本（按平台分支，版本号读 pyproject.toml）
+pyproject.toml       # uv / pip 依赖声明，版本号单一来源
+build.py             # 跨平台打包脚本（本地开发用）
+release_build.py     # 发布构建：自动按 OS/arch/版本号命名产物到 dist/release/
+release_publish.py   # 一键发布到 GitHub Release（基于 gh CLI）
 readme.md            # 本文件
 icon/                # 应用图标
 ├── generate_icon.py # 图标生成器（可重跑）
