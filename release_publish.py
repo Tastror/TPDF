@@ -107,6 +107,26 @@ def remote_tag_exists(tag: str) -> bool:
     return bool(r.stdout.strip())
 
 
+def fetch_remote_tag(tag: str) -> bool:
+    """尝试把远端 tag 拉到本地。成功返回 True。"""
+    r = run(["git", "fetch", "origin", "tag", tag, "--no-tags"],
+            check=False, capture=True)
+    return r.returncode == 0 and local_tag_exists(tag)
+
+
+def head_commit() -> str:
+    r = run(["git", "rev-parse", "HEAD"], capture=True)
+    return r.stdout.strip()
+
+
+def tag_commit(tag: str) -> str | None:
+    """返回 tag 指向的 commit SHA（annotated tag 会被解引用到目标 commit）。"""
+    r = run(["git", "rev-list", "-n", "1", tag], check=False, capture=True)
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
 def release_exists(tag: str) -> bool:
     r = run(["gh", "release", "view", tag, "--json", "tagName"],
             check=False, capture=True)
@@ -169,7 +189,9 @@ def main() -> int:
     ap.add_argument("--notes", help="自定义 release notes（字符串）")
     ap.add_argument("--notes-file", help="使用文件内容作为 release notes")
     ap.add_argument("--allow-dirty", action="store_true",
-                    help="允许工作区有未提交修改")
+                    help="允许工作区有未提交修改（产物可能与 tag commit 不一致）")
+    ap.add_argument("--allow-mismatch", action="store_true",
+                    help="补发时允许 HEAD 与 tag 指向的 commit 不一致（强烈不推荐）")
     ap.add_argument("--no-sha256", action="store_true",
                     help="不上传 .sha256 校验文件")
     ap.add_argument("--yes", "-y", action="store_true",
@@ -184,10 +206,55 @@ def main() -> int:
 
     print(f"▶ 版本：{version}   tag：{tag}")
 
-    # 1. 工作区状态
+    # 1. 先识别本次属于"首发"还是"补发"
+    #    - tag 不存在 → 首发（需要打 tag、推 tag → 要求 HEAD 正确 + 工作区干净）
+    #    - tag 已存在（本地或远端） → 补发（纯上传，不碰 git，工作区随便）
+    has_local_tag = local_tag_exists(tag)
+    has_remote_tag = remote_tag_exists(tag)
+
+    if not has_local_tag and has_remote_tag:
+        print(f"▶ 远端已有 tag {tag}，本地没有，尝试 fetch 下来。")
+        if fetch_remote_tag(tag):
+            has_local_tag = True
+        else:
+            print(f"警告：fetch tag {tag} 失败，稍后会在当前 HEAD 尝试创建。",
+                  file=sys.stderr)
+
+    tag_already_exists = has_local_tag or has_remote_tag
+    is_new_tag = not tag_already_exists
+
+    if is_new_tag:
+        print(f"▶ 首发模式：tag {tag} 不存在，将在当前 HEAD ({head_commit()[:7]}) 上创建。")
+    else:
+        # 补发：必须验证 HEAD 与 tag 指向的 commit 一致，
+        # 否则这次 build 出来的产物和已发布的来自不同 commit，release 里会混着两份代码。
+        tag_sha = tag_commit(tag)
+        head_sha = head_commit()
+        if tag_sha is None:
+            print(f"错误：无法解析 tag {tag} 指向的 commit。", file=sys.stderr)
+            return 1
+        if head_sha != tag_sha:
+            msg = (f"错误：HEAD ({head_sha[:7]}) 与 tag {tag} 指向的 commit "
+                   f"({tag_sha[:7]}) 不一致。\n"
+                   f"      同一个 release 的不同平台产物必须来自同一个 commit，"
+                   f"否则二进制会对不上。\n"
+                   f"      解决：\n"
+                   f"        git checkout {tag}\n"
+                   f"        uv run --extra build python release_build.py --clean\n"
+                   f"        python release_publish.py\n"
+                   f"      如果你非常清楚自己在做什么，可以加 `--allow-mismatch` 跳过。")
+            if not args.allow_mismatch:
+                print(msg, file=sys.stderr)
+                return 1
+            print("⚠ HEAD 与 tag commit 不一致（--allow-mismatch 已启用）。", file=sys.stderr)
+        else:
+            print(f"▶ 补发模式：HEAD 与 tag {tag} 一致 ({head_sha[:7]})。")
+
+    # 工作区必须干净（产物否则不对应任何 commit）
     if not git_is_clean():
         if not args.allow_dirty:
-            print("错误：工作区存在未提交的修改。请先 commit，或加 `--allow-dirty` 跳过。",
+            print("错误：工作区存在未提交的修改，产物将无法对应任何 commit。\n"
+                  "      请先 commit / stash，或加 `--allow-dirty` 跳过。",
                   file=sys.stderr)
             return 1
         print("⚠ 工作区未清理（--allow-dirty 已启用）。")
@@ -205,21 +272,21 @@ def main() -> int:
         mode.append("草稿")
     if args.prerelease:
         mode.append("预发布")
+    if not is_new_tag:
+        mode.append("补发")
     mode_str = f"（{' + '.join(mode)}）" if mode else ""
     if not confirm(f"确认发布 {title}{mode_str} 到 GitHub？", args.yes):
         print("已取消。")
         return 1
 
-    # 4. tag
-    if local_tag_exists(tag):
-        print(f"▶ 本地已存在 tag {tag}，跳过创建。")
-    else:
+    # 4. tag 处理（仅首发路径需要）
+    if is_new_tag:
         run(["git", "tag", "-a", tag, "-m", title])
-
-    if remote_tag_exists(tag):
-        print(f"▶ 远端 origin 已存在 tag {tag}，跳过推送。")
-    else:
         run(["git", "push", "origin", tag])
+    else:
+        if not has_remote_tag:
+            # 极少见：远端没 tag 但本地有（比如上次推送失败）
+            run(["git", "push", "origin", tag])
 
     # 5. create or upload
     artifact_paths = [str(p) for p in artifacts]
