@@ -1403,7 +1403,12 @@ class PdfEditTab(TabBase):
         self.split_markers: set[int] = set()
 
         # ── 视图状态 ──
-        self.item_widgets: list[tk.Frame] = []
+        # 为了支持上千页的大文件，采用"虚拟化"渲染：只为视口内的页生成 Frame 控件，
+        # 滚动时按需创建 / 销毁。这样可以绕过 Tk 子窗口 16-bit 坐标上限（约 32767 像素），
+        # 否则页数很多时后半部分会叠在一起或直接不显示。
+        self.item_widgets: dict[int, tk.Frame] = {}  # idx -> Frame（仅含可见项）
+        self._item_wids: dict[int, int] = {}         # idx -> canvas window id
+        self._seg_no_cache: list[int] = []           # 段号缓存，_relayout 时刷新
         self.thumb_cache: dict[tuple[int, int], ImageTk.PhotoImage] = {}
         self._placeholder: Optional[ImageTk.PhotoImage] = None
         self._current_cols = 1
@@ -1414,9 +1419,11 @@ class PdfEditTab(TabBase):
         self._dragging = False
         self._drop_target: Optional[int] = None
         self._drop_indicator: Optional[tk.Frame] = None
+        self._drop_indicator_id: Optional[int] = None  # canvas window id
 
         # ── 渲染线程控制 ──
         self._render_stop = threading.Event()
+        self._render_worker_active = False
 
         # ── UI 变量 ──
         self.page_expr_var = tk.StringVar(value="")
@@ -1424,6 +1431,8 @@ class PdfEditTab(TabBase):
         self.chunk_size_var = tk.StringVar(value="10")
         self.status_var = tk.StringVar(value="尚未加载 PDF")
         self.out_var = tk.StringVar(value=normalize_path(desktop))
+        # 切换导出模式时（特别是进出 "按切分点拆分"）需要刷新"段 N"徽章
+        self.mode_var.trace_add("write", lambda *_: self._on_mode_change())
 
         # ── 记住上次用过的路径（"添加 PDF" 无 Entry 可读时用）──
         self._last_input_dir: Optional[str] = None
@@ -1479,17 +1488,17 @@ class PdfEditTab(TabBase):
 
         vbar = ttk.Scrollbar(holder, orient="vertical", command=self.canvas.yview)
         vbar.grid(row=0, column=1, sticky="ns")
-        self.canvas.configure(yscrollcommand=vbar.set)
 
-        self.inner = tk.Frame(self.canvas, background="#ffffff")
-        self._inner_window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        # yscrollcommand 包装：画布每次滚动 / 视图变化 都会触发，正好用来驱动虚拟化
+        def _on_yscroll(first, last) -> None:
+            vbar.set(first, last)
+            self._update_visible()
+        self.canvas.configure(yscrollcommand=_on_yscroll)
 
         # 滚轮
         self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._on_mousewheel))
         self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
         self.canvas.bind("<Configure>", self._on_canvas_resize)
-        self.inner.bind("<Configure>",
-                        lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
 
         # 画布空白区点击 → 取消选择
         self.canvas.bind("<Button-1>", self._on_canvas_click)
@@ -1600,6 +1609,8 @@ class PdfEditTab(TabBase):
 
         ttk.Radiobutton(out, text="合并为一个 PDF",
                         variable=self.mode_var, value="merge").pack(anchor="w")
+        ttk.Radiobutton(out, text="仅导出选中页（合并）",
+                        variable=self.mode_var, value="selected").pack(anchor="w")
         ttk.Radiobutton(out, text="按切分点拆分",
                         variable=self.mode_var, value="marker").pack(anchor="w")
         row = ttk.Frame(out); row.pack(anchor="w")
@@ -1710,6 +1721,7 @@ class PdfEditTab(TabBase):
             return
         self._render_stop.set()
         self._render_stop = threading.Event()
+        self._render_worker_active = False
         for d in self.loaded_docs:
             try:
                 d["doc"].close()
@@ -1950,6 +1962,10 @@ class PdfEditTab(TabBase):
             messagebox.showerror("错误", "无法解析页码表达式")
             return
         self._set_selection(ranges)
+        # 页码表达式常用于大文件"跳选后几百页"等场景——自动滚动到第一个选中项，
+        # 方便用户直接查看
+        if ranges:
+            self._scroll_to_idx(min(ranges))
 
     def _on_select_all(self) -> None:
         self._set_selection(set(range(len(self.pages))))
@@ -1963,7 +1979,9 @@ class PdfEditTab(TabBase):
 
     def _on_canvas_click(self, event) -> None:
         # 点到画布空白处 → 清除选择
-        if self.canvas.find_withtag("current") == (self._inner_window,):
+        # 虚拟化后没有 inner frame；画布上的点击会路由给子窗口（item frame）处理；
+        # 能进入本回调说明点在了空白区域。
+        if not self.canvas.find_withtag("current"):
             self._set_selection(set())
 
     # ------------------------------------------------------------------
@@ -2044,6 +2062,9 @@ class PdfEditTab(TabBase):
         self.split_markers.clear()
         self.anchor_idx = None
         self._relayout()
+        # 跟随焦点：置顶后滚到第一项，置底后滚到最后
+        if self.selected:
+            self._scroll_to_idx(min(self.selected) if to_top else max(self.selected))
 
     def _on_toggle_markers(self) -> None:
         if not self.selected:
@@ -2057,26 +2078,35 @@ class PdfEditTab(TabBase):
             else:
                 self.split_markers.add(i)
         self._update_status()
-        self._refresh_item_styles()
+        # 切分点变了 → 段号 / "段 N" 徽章都要重建
+        self._relayout()
 
     def _on_clear_markers(self) -> None:
         if not self.split_markers:
             return
         self.split_markers.clear()
         self._update_status()
-        self._refresh_item_styles()
+        self._relayout()
+
+    def _on_mode_change(self) -> None:
+        # "段 N" 徽章只在 marker 模式下显示；状态栏分段计数也跟模式走
+        self._update_status()
+        # 仅当已有页面时重建（避免 __init__ 阶段就 relayout）
+        if self.pages:
+            self._relayout()
 
     # ------------------------------------------------------------------
     # 布局与渲染
     # ------------------------------------------------------------------
 
     def _on_canvas_resize(self, event) -> None:
-        # 让 inner 宽度跟上 canvas
-        self.canvas.itemconfig(self._inner_window, width=event.width - 2)
-        cols = max(1, (event.width - 2 * self.CELL_PAD) // self.CELL_W)
+        stride_x = self.CELL_W + 2 * self.CELL_PAD
+        cols = max(1, event.width // stride_x)
         if cols != self._current_cols:
             self._current_cols = cols
             self._relayout()
+        else:
+            self._update_visible()
 
     def _on_mousewheel(self, event) -> None:
         self.canvas.yview_scroll(int(-event.delta / 120), "units")
@@ -2098,30 +2128,136 @@ class PdfEditTab(TabBase):
         return self._placeholder
 
     def _relayout(self) -> None:
-        """销毁旧的 item widget，按 self.pages 重建网格。"""
-        for w in self.item_widgets:
-            w.destroy()
-        self.item_widgets.clear()
-        if self._drop_indicator is not None:
-            self._drop_indicator.place_forget()
+        """按 self.pages 重新规划网格总尺寸，并刷新视口内的 item 控件。
 
-        # 预计算段号（用于显示"段 N"徽章）
-        seg_no = self._compute_segment_numbers()
+        采用虚拟化：先销毁当前所有可见 item，重新计算 scrollregion，再调用
+        ``_update_visible()`` 为视口内的页生成控件。其他行在滚动时按需创建。
+        """
+        for idx in list(self.item_widgets.keys()):
+            frame = self.item_widgets.pop(idx)
+            wid = self._item_wids.pop(idx, None)
+            if wid is not None:
+                try:
+                    self.canvas.delete(wid)
+                except tk.TclError:
+                    pass
+            frame.destroy()
+
+        if self._drop_indicator_id is not None:
+            try:
+                self.canvas.delete(self._drop_indicator_id)
+            except tk.TclError:
+                pass
+            self._drop_indicator_id = None
+        if self._drop_indicator is not None:
+            try:
+                self._drop_indicator.destroy()
+            except tk.TclError:
+                pass
+            self._drop_indicator = None
+
+        # 段号缓存：每次布局重算，_make_item 内的 "段 N" 徽章读这个
+        self._seg_no_cache = self._compute_segment_numbers()
 
         cols = max(1, self._current_cols)
-        for i, page in enumerate(self.pages):
-            item = self._make_item(i, page, seg_no[i])
-            r, c = divmod(i, cols)
-            item.grid(row=r, column=c, padx=self.CELL_PAD, pady=self.CELL_PAD, sticky="n")
-            self.item_widgets.append(item)
+        n = len(self.pages)
+        rows = (n + cols - 1) // cols if n > 0 else 0
+        stride_x = self.CELL_W + 2 * self.CELL_PAD
+        stride_y = self.CELL_H + 2 * self.CELL_PAD
+        total_w = cols * stride_x
+        total_h = rows * stride_y
+        # Canvas 的 scrollregion 用 double 存储，没有 16-bit 限制，因此页数很多时也 OK
+        self.canvas.configure(scrollregion=(0, 0, total_w, total_h))
+
+        self._update_visible()
+
+    def _update_visible(self) -> None:
+        """按当前视口，创建 / 销毁 item 控件（虚拟化核心）。"""
+        n = len(self.pages)
+        if n == 0:
+            # 没有页：清掉残留控件
+            for idx in list(self.item_widgets.keys()):
+                frame = self.item_widgets.pop(idx)
+                wid = self._item_wids.pop(idx, None)
+                if wid is not None:
+                    try:
+                        self.canvas.delete(wid)
+                    except tk.TclError:
+                        pass
+                frame.destroy()
+            return
+
+        cols = max(1, self._current_cols)
+        stride_x = self.CELL_W + 2 * self.CELL_PAD
+        stride_y = self.CELL_H + 2 * self.CELL_PAD
+
+        ch = max(1, self.canvas.winfo_height())
+        view_top = self.canvas.canvasy(0)
+        view_bot = view_top + ch
+
+        # 多渲染前后各 2 行作为缓冲，滚动时不会看到明显的"现加载"跳变
+        first_row = max(0, int(view_top // stride_y) - 2)
+        last_row = int(view_bot // stride_y) + 2
+        max_row = (n - 1) // cols
+        first_row = min(first_row, max_row)
+        last_row = min(last_row, max_row)
+
+        first_idx = first_row * cols
+        last_idx = min(n - 1, (last_row + 1) * cols - 1)
+        needed = set(range(first_idx, last_idx + 1))
+        existing = set(self.item_widgets.keys())
+
+        # 销毁视口外的
+        for idx in existing - needed:
+            frame = self.item_widgets.pop(idx)
+            wid = self._item_wids.pop(idx, None)
+            if wid is not None:
+                try:
+                    self.canvas.delete(wid)
+                except tk.TclError:
+                    pass
+            frame.destroy()
+
+        # 创建视口内缺失的
+        seg_no = self._seg_no_cache
+        for idx in sorted(needed - existing):
+            if idx >= n:
+                continue
+            page = self.pages[idx]
+            seg = seg_no[idx] if idx < len(seg_no) else 1
+            frame = self._make_item(idx, page, seg)
+            r, c = divmod(idx, cols)
+            x = c * stride_x + self.CELL_PAD
+            y = r * stride_y + self.CELL_PAD
+            wid = self.canvas.create_window(
+                x, y, window=frame, anchor="nw",
+                width=self.CELL_W, height=self.CELL_H,
+            )
+            self.item_widgets[idx] = frame
+            self._item_wids[idx] = wid
 
         self._refresh_item_styles()
-        self.inner.update_idletasks()
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._schedule_render_missing()
+
+    def _scroll_to_idx(self, idx: int) -> None:
+        """把指定 index 的页尽量滚到视口顶端附近。"""
+        if idx < 0 or idx >= len(self.pages):
+            return
+        cols = max(1, self._current_cols)
+        r = idx // cols
+        stride_y = self.CELL_H + 2 * self.CELL_PAD
+        n = len(self.pages)
+        total_rows = (n + cols - 1) // cols
+        total_h = max(1, total_rows * stride_y)
+        # 略微上移一点，让目标行不贴画布顶端
+        y = max(0, r * stride_y - self.CELL_PAD)
+        frac = y / total_h
+        self.canvas.yview_moveto(max(0.0, min(1.0, frac)))
+        # yscrollcommand 钩子会自动触发 _update_visible
 
     def _make_item(self, idx: int, page: PageRef, seg: int) -> tk.Frame:
         frame = tk.Frame(
-            self.inner, width=self.CELL_W - self.CELL_PAD * 2, height=self.CELL_H,
+            self.canvas, width=self.CELL_W, height=self.CELL_H,
             background=self.CLR_ITEM_BG,
             highlightthickness=2, highlightbackground=self.CLR_ITEM_BD,
         )
@@ -2170,7 +2306,8 @@ class PdfEditTab(TabBase):
         return seg_no
 
     def _refresh_item_styles(self) -> None:
-        for i, frame in enumerate(self.item_widgets):
+        # 虚拟化后 item_widgets 只含视口内的项，这里按 dict 遍历即可
+        for i, frame in self.item_widgets.items():
             if i in self.selected:
                 frame.configure(highlightbackground=self.CLR_ITEM_SEL, highlightcolor=self.CLR_ITEM_SEL)
             elif (i - 1) in self.split_markers:
@@ -2185,15 +2322,39 @@ class PdfEditTab(TabBase):
     # ------------------------------------------------------------------
 
     def _schedule_render_missing(self) -> None:
+        # 虚拟化后只渲染"当前可见"的页缩略图；滚动到新行时再次调用即可。
+        # 同时用 _render_worker_active 防止重复启动后台线程
+        if self._render_worker_active:
+            return
+        n = len(self.pages)
         todo: list[tuple[int, int]] = []
-        for p in self.pages:
+        seen: set[tuple[int, int]] = set()
+        for idx in self.item_widgets.keys():
+            if idx >= n:
+                continue
+            p = self.pages[idx]
             k = (p.doc_id, p.page_index)
-            if k not in self.thumb_cache:
+            if k not in self.thumb_cache and k not in seen:
                 todo.append(k)
+                seen.add(k)
         if not todo:
             return
+        self._render_worker_active = True
         stop = self._render_stop
-        run_in_background(lambda: self._render_worker(todo, stop))
+
+        def _wrapper(keys: list[tuple[int, int]] = todo, stop_ev: threading.Event = stop) -> None:
+            try:
+                self._render_worker(keys, stop_ev)
+            finally:
+                self._render_worker_active = False
+                # 线程结束后，再给主线程发一次调度；如果滚动期间又有新的 pending
+                # 项，会在那里被再次 pickup
+                try:
+                    self.after(0, self._schedule_render_missing)
+                except tk.TclError:
+                    pass
+
+        run_in_background(_wrapper)
 
     def _render_worker(self, keys: list[tuple[int, int]], stop: threading.Event) -> None:
         for doc_id, page_index in keys:
@@ -2232,12 +2393,13 @@ class PdfEditTab(TabBase):
         photo = self.thumb_cache.get(key)
         if photo is None:
             return
-        for i, page in enumerate(self.pages):
+        # 只更新当前视口内的 item；视口外的项还没创建，等滚动到时会从缓存读
+        for i, frame in self.item_widgets.items():
+            if i >= len(self.pages):
+                continue
+            page = self.pages[i]
             if (page.doc_id, page.page_index) != key:
                 continue
-            if i >= len(self.item_widgets):
-                continue
-            frame = self.item_widgets[i]
             for child in frame.winfo_children():
                 if isinstance(child, tk.Label) and getattr(child, "image", None) is not None:
                     child.configure(image=photo)
@@ -2308,56 +2470,67 @@ class PdfEditTab(TabBase):
             self.anchor_idx = idx
 
     def _hit_test(self, x_root: int, y_root: int) -> int:
-        """根据屏幕坐标判断：应插入到哪一个 index 之前（0..len）。"""
-        if not self.item_widgets:
+        """根据屏幕坐标判断：应插入到哪一个 index 之前（0..len）。
+
+        虚拟化后不能再枚举 item_widgets；改用精确几何公式，基于 cell stride 直接算。
+        """
+        n = len(self.pages)
+        if n == 0:
             return 0
-        # 转换到 inner frame 坐标
-        ix = x_root - self.inner.winfo_rootx()
-        iy = y_root - self.inner.winfo_rooty()
-        # 按行匹配
-        rows: dict[int, list[int]] = {}
-        for i, w in enumerate(self.item_widgets):
-            y = w.winfo_y()
-            rows.setdefault(y, []).append(i)
-        row_ys = sorted(rows.keys())
-        # 选中最接近的行
-        chosen_row = row_ys[0]
-        for y in row_ys:
-            h = self.item_widgets[rows[y][0]].winfo_height()
-            if y <= iy < y + h:
-                chosen_row = y
-                break
-            if iy >= y + h:
-                chosen_row = y
-        indices = rows[chosen_row]
-        # 在该行内按 x 判定
-        for i in indices:
-            w = self.item_widgets[i]
-            wx, ww = w.winfo_x(), w.winfo_width()
-            if ix < wx + ww // 2:
-                return i
-        # 插入到该行末尾（= 下一行首或整体末尾）
-        return indices[-1] + 1
+        cx = self.canvas.canvasx(x_root - self.canvas.winfo_rootx())
+        cy = self.canvas.canvasy(y_root - self.canvas.winfo_rooty())
+        cols = max(1, self._current_cols)
+        stride_x = self.CELL_W + 2 * self.CELL_PAD
+        stride_y = self.CELL_H + 2 * self.CELL_PAD
+        r = max(0, int(cy // stride_y))
+        max_r = (n - 1) // cols
+        r = min(r, max_r)
+        c = max(0, min(cols - 1, int(cx // stride_x)))
+        idx = r * cols + c
+        if idx >= n:
+            return n
+        # 命中 cell 内 x 位置：过半 → 插入到该 idx 之后
+        x_in_cell = cx - c * stride_x
+        if x_in_cell > stride_x / 2:
+            return min(idx + 1, n)
+        return idx
 
     def _show_drop_indicator(self, target: int) -> None:
+        n = len(self.pages)
+        if n == 0:
+            return
         if self._drop_indicator is None:
-            self._drop_indicator = tk.Frame(self.inner, background=self.CLR_DROP)
-        if target < len(self.item_widgets):
-            w = self.item_widgets[target]
-            x = w.winfo_x() - 3
-            y = w.winfo_y()
-            h = w.winfo_height()
+            self._drop_indicator = tk.Frame(self.canvas, background=self.CLR_DROP)
+        cols = max(1, self._current_cols)
+        stride_x = self.CELL_W + 2 * self.CELL_PAD
+        stride_y = self.CELL_H + 2 * self.CELL_PAD
+        if target >= n:
+            # 插入到最后一页之后：指示线画在最后一页右侧
+            last = n - 1
+            r, c = divmod(last, cols)
+            x = c * stride_x + self.CELL_PAD + self.CELL_W
         else:
-            w = self.item_widgets[-1]
-            x = w.winfo_x() + w.winfo_width() + 1
-            y = w.winfo_y()
-            h = w.winfo_height()
-        self._drop_indicator.place(x=x, y=y, width=3, height=h)
-        self._drop_indicator.lift()
+            r, c = divmod(target, cols)
+            x = c * stride_x + self.CELL_PAD - 3
+        y = r * stride_y + self.CELL_PAD
+        h = self.CELL_H
+        if self._drop_indicator_id is None:
+            self._drop_indicator_id = self.canvas.create_window(
+                x, y, window=self._drop_indicator, anchor="nw", width=3, height=h,
+            )
+        else:
+            self.canvas.coords(self._drop_indicator_id, x, y)
+            self.canvas.itemconfigure(
+                self._drop_indicator_id, width=3, height=h, state="normal",
+            )
+        self.canvas.tag_raise(self._drop_indicator_id)
 
     def _hide_drop_indicator(self) -> None:
-        if self._drop_indicator is not None:
-            self._drop_indicator.place_forget()
+        if self._drop_indicator_id is not None:
+            try:
+                self.canvas.itemconfigure(self._drop_indicator_id, state="hidden")
+            except tk.TclError:
+                self._drop_indicator_id = None
 
     def _move_selected_to(self, target: int) -> None:
         if not self.selected:
@@ -2417,6 +2590,11 @@ class PdfEditTab(TabBase):
         mode = self.mode_var.get()
         if mode == "merge":
             segments = [list(self.pages)]
+        elif mode == "selected":
+            if not self.selected:
+                messagebox.showerror("错误", "请先选择要导出的页面")
+                return
+            segments = [[self.pages[i] for i in sorted(self.selected)]]
         elif mode == "marker":
             segments = self._segments_by_markers()
         elif mode == "chunk":
@@ -2434,7 +2612,8 @@ class PdfEditTab(TabBase):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         outputs: list[str] = []
         if len(segments) == 1:
-            outputs.append(os.path.join(out_dir, f"TPDF-merged-{ts}.pdf"))
+            prefix = "selected" if mode == "selected" else "merged"
+            outputs.append(os.path.join(out_dir, f"TPDF-{prefix}-{ts}.pdf"))
         else:
             for i in range(len(segments)):
                 outputs.append(os.path.join(out_dir, f"TPDF-{ts}-part_{i + 1:02d}.pdf"))
